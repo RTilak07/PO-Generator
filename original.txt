@@ -1,0 +1,1309 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog, simpledialog
+from openpyxl import load_workbook
+from datetime import date
+import os
+import re
+from num2words import num2words
+from PIL import Image, ImageTk
+import subprocess
+import tempfile
+
+SAVE_FOLDER = "POs"
+if not os.path.exists(SAVE_FOLDER):
+    os.makedirs(SAVE_FOLDER)
+
+
+def _all_po_files():
+    """Yield full paths to all .xlsx PO files under SAVE_FOLDER (recursively)."""
+    for root, _, files in os.walk(SAVE_FOLDER):
+        for f in files:
+            if f.lower().endswith(".xlsx"):
+                yield os.path.join(root, f)
+
+
+def get_next_po_number():
+    """Return next PO integer by scanning all existing POs (original + revisions)."""
+    max_num = 0
+    pat = re.compile(r"^PO[-_]?(\d+)", re.IGNORECASE)
+    for path in _all_po_files():
+        name = os.path.basename(path)
+        m = pat.match(name)
+        if m:
+            try:
+                num = int(m.group(1))
+                if num > max_num:
+                    max_num = num
+            except ValueError:
+                pass
+    return max_num + 1
+
+
+def load_previous_suggestions():
+    names, addresses, srefs, orefs, units = set(), set(), set(), set(), set()
+    for path in _all_po_files():
+        try:
+            wb = load_workbook(path, data_only=True)
+            ws = wb.active
+
+            val = ws["A10"].value
+            if val:
+                parts = val.split("\n", 1)
+                if parts:
+                    names.add(parts[0].strip())
+                if len(parts) > 1 and parts[1].strip():
+                    addresses.add(parts[1].strip())
+
+            sref = ws["G9"].value
+            if sref:
+                srefs.add(str(sref))
+
+            oref = ws["I9"].value
+            if oref:
+                orefs.add(str(oref))
+
+            # Load units from items
+            row = 15
+            while ws[f"A{row}"].value:
+                unit = ws[f"E{row}"].value
+                if unit:
+                    units.add(str(unit))
+                row += 1
+        except Exception:
+            pass
+    
+    # Add default units
+    units.update(["Nos", "Sets", "Services", "Kgs", "Meters", "Pieces", "Hours", "Litres", "Boxes", "Packets"])
+    return list(names), list(addresses), list(srefs), list(orefs), list(units)
+
+
+def _normalize_po_number(s: str) -> str:
+    """Accept '001', 'PO-1', 'po_12' and normalize to 'PO-XXX' zero-padded to 3+ digits."""
+    s = (s or "").strip().upper()
+    m = re.search(r"(\d+)", s)
+    if not m:
+        return s or "PO-001"
+    num = int(m.group(1))
+    if num < 1000:
+        return f"PO-{num:03d}"
+    return f"PO-{num}"
+
+
+def safe_float(value, default=0.0):
+    """Safely convert value to float"""
+    try:
+        if value is None or value == "":
+            return default
+        return float(str(value).strip())
+    except (ValueError, TypeError):
+        return default
+
+
+def safe_int(value, default=0):
+    """Safely convert value to int"""
+    try:
+        if value is None or value == "":
+            return default
+        return int(str(value).strip())
+    except (ValueError, TypeError):
+        return default
+
+
+class AutocompleteCombobox(ttk.Combobox):
+    """Combobox with autocomplete functionality"""
+    def __init__(self, parent, values=None, **kwargs):
+        super().__init__(parent, **kwargs)
+        self._values = values or []
+        self['values'] = self._values
+        self.bind('<KeyRelease>', self._on_keyrelease)
+        self.bind('<Button-1>', self._on_click)
+        
+    def _on_keyrelease(self, event):
+        # Get current text
+        current = self.get()
+        if not current:
+            self['values'] = self._values
+            return
+            
+        # Filter values that start with current text (case insensitive)
+        matches = [v for v in self._values if v.lower().startswith(current.lower())]
+        
+        # Update values
+        self['values'] = matches
+        
+        # Show dropdown if there are matches
+        if matches:
+            self.event_generate('<Button-1>')
+            
+    def _on_click(self, event):
+        # Show all values when clicked
+        self['values'] = self._values
+        
+    def update_values(self, new_values):
+        """Update the list of values"""
+        self._values = new_values or []
+        self['values'] = self._values
+
+
+class ScrollableFrame(tk.Frame):
+    """A scrollable frame that can contain other widgets"""
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, **kwargs)
+        
+        # Create canvas and scrollbar
+        self.canvas = tk.Canvas(self, bg=kwargs.get('bg', 'white'))
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = tk.Frame(self.canvas, bg=kwargs.get('bg', 'white'))
+
+        # Configure scrolling
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        )
+
+        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+
+        # Pack canvas and scrollbar
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
+
+        # Bind mousewheel to canvas
+        self.bind_mousewheel()
+
+    def bind_mousewheel(self):
+        """Bind mouse wheel events to the canvas"""
+        def _on_mousewheel(event):
+            self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        
+        def _bind_to_mousewheel(event):
+            self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        
+        def _unbind_from_mousewheel(event):
+            self.canvas.unbind_all("<MouseWheel>")
+        
+        self.canvas.bind('<Enter>', _bind_to_mousewheel)
+        self.canvas.bind('<Leave>', _unbind_from_mousewheel)
+
+
+class POApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Purchase Order Generator - Enhanced Version")
+        self.root.geometry("1400x900")
+        self.root.configure(bg="#f0f0f0")
+        self.items = []
+
+        # Load suggestions including units
+        self.supplier_names, self.supplier_addresses, self.supplier_refs, self.other_refs, self.units = load_previous_suggestions()
+
+        # ---------- Main Container ----------
+        main_container = tk.Frame(root, bg="#f0f0f0")
+        main_container.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # ---------- Left Frame (Scrollable Form) ----------
+        self.left_frame_container = ScrollableFrame(main_container, bg="#ffffff", relief="ridge", bd=2)
+        self.left_frame_container.pack(side="left", fill="both", expand=True)
+        
+        # The actual form will be inside the scrollable frame
+        self.left_frame = self.left_frame_container.scrollable_frame
+        self.left_frame.configure(padx=20, pady=20)
+
+        # ---------- Right Frame (Preview) ----------
+        self.right_frame = tk.Frame(main_container, padx=15, pady=15, bg="#f8f9fa", relief="ridge", bd=2)
+        self.right_frame.pack(side="right", fill="both", expand=True)
+
+        self.create_form()
+        self.create_preview()
+
+        # Keep preview updated
+        self.root.after(500, self.update_header_preview)
+        
+        # Set up tab navigation
+        self.setup_tab_navigation()
+
+    def setup_tab_navigation(self):
+        """Set up Enter key to move to next field"""
+        widgets = [
+            self.po_number, self.date_entry, self.supplier_name, 
+            self.supplier_address_combo, self.supplier_ref, self.other_ref,
+            self.currency_combo, self.payment_mode, self.gst_type, 
+            self.gst_entry, self.sgst_entry, self.cgst_entry, self.qty_entry, 
+            self.unit_entry, self.price_entry, self.discount_entry
+        ]
+        
+        for i, widget in enumerate(widgets):
+            if i < len(widgets) - 1:
+                widget.bind("<Return>", lambda e, next_widget=widgets[i+1]: next_widget.focus())
+            else:
+                widget.bind("<Return>", lambda e: self.desc_entry.focus())
+        
+        # Special handling for text area
+        self.desc_entry.bind("<Return>", lambda e: self.add_item())
+
+    def create_form(self):
+        """Create the enhanced form with better styling"""
+        # Title
+        title_label = tk.Label(self.left_frame, text="Purchase Order Form", 
+                              font=("Arial", 16, "bold"), fg="#2c5aa0", bg="#ffffff")
+        title_label.grid(row=0, column=0, columnspan=2, pady=(0, 20), sticky="w")
+
+        row = 1
+
+        # PO Number with auto-load functionality and Load button
+        po_frame = tk.Frame(self.left_frame, bg="#ffffff")
+        po_frame.grid(row=row, column=0, columnspan=2, sticky="ew", pady=5)
+        
+        tk.Label(po_frame, text="PO Number", font=("Arial", 10, "bold"), 
+                bg="#ffffff").pack(side="left")
+        
+        self.po_number = tk.Entry(po_frame, font=("Arial", 10), width=20)
+        self.po_number.insert(0, f"PO-{get_next_po_number():03d}")
+        self.po_number.pack(side="left", padx=(10, 5))
+        self.po_number.bind("<KeyRelease>", self.on_po_number_change)
+        self.po_number.bind("<Return>", self.load_po_by_number)
+        
+        # Load button next to PO number
+        self.load_btn_small = tk.Button(po_frame, text="Load", command=self.load_po_by_number,
+                                       font=("Arial", 9), bg="#6c757d", fg="white", width=6)
+        self.load_btn_small.pack(side="left")
+        
+        row += 1
+
+        # Date
+        tk.Label(self.left_frame, text="Date", font=("Arial", 10, "bold"), 
+                bg="#ffffff").grid(row=row, column=0, sticky="w", pady=5)
+        self.date_entry = tk.Entry(self.left_frame, font=("Arial", 10), width=25)
+        self.date_entry.insert(0, date.today().strftime("%d-%m-%Y"))
+        self.date_entry.grid(row=row, column=1, sticky="w", pady=5, padx=(10, 0))
+        row += 1
+
+        # Currency
+        tk.Label(self.left_frame, text="Currency", font=("Arial", 10, "bold"), 
+                bg="#ffffff").grid(row=row, column=0, sticky="w", pady=5)
+        self.currency_combo = ttk.Combobox(self.left_frame, values=["INR", "USD", "EUR", "GBP", "SGD"], 
+                                         font=("Arial", 10), width=23, state="readonly")
+        self.currency_combo.current(0)
+        self.currency_combo.grid(row=row, column=1, sticky="w", pady=5, padx=(10, 0))
+        row += 1
+
+        # Supplier Name with AutoComplete
+        tk.Label(self.left_frame, text="Supplier Name", font=("Arial", 10, "bold"), 
+                bg="#ffffff").grid(row=row, column=0, sticky="w", pady=5)
+        self.supplier_name = AutocompleteCombobox(self.left_frame, values=self.supplier_names, 
+                                                 font=("Arial", 10), width=23)
+        self.supplier_name.grid(row=row, column=1, sticky="w", pady=5, padx=(10, 0))
+        row += 1
+
+        # Supplier Address with AutoComplete + Large Text Box
+        tk.Label(self.left_frame, text="Supplier Address", font=("Arial", 10, "bold"), 
+                bg="#ffffff").grid(row=row, column=0, sticky="nw", pady=5)
+        self.supplier_address_combo = AutocompleteCombobox(self.left_frame, values=self.supplier_addresses, 
+                                                          font=("Arial", 10), width=23)
+        self.supplier_address_combo.grid(row=row, column=1, sticky="w", pady=5, padx=(10, 0))
+        row += 1
+
+        # Large text box for address
+        self.supplier_address_text = tk.Text(self.left_frame, width=35, height=5, wrap="word", 
+                                           font=("Arial", 10), relief="solid", bd=1)
+        self.supplier_address_text.grid(row=row, column=1, sticky="w", pady=5, padx=(10, 0))
+
+        def fill_address_from_combo(event):
+            self.supplier_address_text.delete("1.0", tk.END)
+            self.supplier_address_text.insert("1.0", self.supplier_address_combo.get())
+
+        self.supplier_address_combo.bind("<<ComboboxSelected>>", fill_address_from_combo)
+        row += 1
+
+        # Supplier Ref with AutoComplete
+        tk.Label(self.left_frame, text="Supplier Ref", font=("Arial", 10, "bold"), 
+                bg="#ffffff").grid(row=row, column=0, sticky="w", pady=5)
+        self.supplier_ref = AutocompleteCombobox(self.left_frame, values=self.supplier_refs, 
+                                               font=("Arial", 10), width=23)
+        self.supplier_ref.grid(row=row, column=1, sticky="w", pady=5, padx=(10, 0))
+        row += 1
+
+        # Other Ref with AutoComplete
+        tk.Label(self.left_frame, text="Other Ref", font=("Arial", 10, "bold"), 
+                bg="#ffffff").grid(row=row, column=0, sticky="w", pady=5)
+        self.other_ref = AutocompleteCombobox(self.left_frame, values=self.other_refs, 
+                                            font=("Arial", 10), width=23)
+        self.other_ref.grid(row=row, column=1, sticky="w", pady=5, padx=(10, 0))
+        row += 1
+
+        # Payment Mode
+        tk.Label(self.left_frame, text="Payment Mode", font=("Arial", 10, "bold"), 
+                bg="#ffffff").grid(row=row, column=0, sticky="w", pady=5)
+        self.payment_mode = ttk.Combobox(self.left_frame, values=["Cash", "Bank Transfer", "UPI", "Credit"], 
+                                       font=("Arial", 10), width=23)
+        self.payment_mode.current(0)
+        self.payment_mode.grid(row=row, column=1, sticky="w", pady=5, padx=(10, 0))
+        row += 1
+
+        # Notes
+        tk.Label(self.left_frame, text="Notes", font=("Arial", 10, "bold"), 
+                bg="#ffffff").grid(row=row, column=0, sticky="nw", pady=5)
+        
+        self.notes_text = tk.Text(self.left_frame, width=35, height=4, wrap="word", 
+                                font=("Arial", 10), relief="solid", bd=1)
+        self.notes_text.grid(row=row, column=1, sticky="w", pady=5, padx=(10, 0))
+        row += 1
+
+        # GST Options - Enhanced with dropdown
+        tk.Label(self.left_frame, text="GST Type", font=("Arial", 10, "bold"), 
+                bg="#ffffff").grid(row=row, column=0, sticky="w", pady=5)
+        self.gst_type = ttk.Combobox(self.left_frame, values=["GST", "SGST/CGST", "Others"], 
+                                   font=("Arial", 10), width=23, state="readonly")
+        self.gst_type.current(0)
+        self.gst_type.grid(row=row, column=1, sticky="w", pady=5, padx=(10, 0))
+        self.gst_type.bind("<<ComboboxSelected>>", self.on_gst_type_change)
+        row += 1
+
+        # GST Entry Frame
+        self.gst_frame = tk.Frame(self.left_frame, bg="#ffffff")
+        self.gst_frame.grid(row=row, column=0, columnspan=2, sticky="w", pady=5)
+
+        # Single GST entry (default)
+        tk.Label(self.gst_frame, text="GST (%)", font=("Arial", 10, "bold"), 
+                bg="#ffffff").grid(row=0, column=0, sticky="w", padx=(0, 10))
+        self.gst_entry = tk.Entry(self.gst_frame, font=("Arial", 10), width=10)
+        self.gst_entry.insert(0, "18")
+        self.gst_entry.grid(row=0, column=1, sticky="w")
+
+        # SGST and CGST entries (initially hidden)
+        self.sgst_label = tk.Label(self.gst_frame, text="SGST (%)", font=("Arial", 10, "bold"), 
+                                  bg="#ffffff")
+        self.sgst_entry = tk.Entry(self.gst_frame, font=("Arial", 10), width=10)
+        self.sgst_entry.insert(0, "9")
+
+        self.cgst_label = tk.Label(self.gst_frame, text="CGST (%)", font=("Arial", 10, "bold"), 
+                                  bg="#ffffff")
+        self.cgst_entry = tk.Entry(self.gst_frame, font=("Arial", 10), width=10)
+        self.cgst_entry.insert(0, "9")
+
+        row += 1
+
+        # Separator
+        separator = tk.Frame(self.left_frame, height=2, bg="#cccccc")
+        separator.grid(row=row, column=0, columnspan=2, sticky="ew", pady=15)
+        row += 1
+
+        # Items Section Title
+        tk.Label(self.left_frame, text="Item Details", font=("Arial", 12, "bold"), 
+                fg="#2c5aa0", bg="#ffffff").grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        row += 1
+
+        # Description with larger text box and Add Item button next to it
+        desc_frame = tk.Frame(self.left_frame, bg="#ffffff")
+        desc_frame.grid(row=row, column=0, columnspan=2, sticky="ew", pady=5)
+        
+        tk.Label(desc_frame, text="Description", font=("Arial", 10, "bold"), 
+                bg="#ffffff").pack(side="left", anchor="n")
+        
+        self.desc_entry = tk.Text(desc_frame, width=25, height=3, wrap="word", 
+                                font=("Arial", 10), relief="solid", bd=1)
+        self.desc_entry.pack(side="left", padx=(10, 5))
+        
+        # Add Item button next to description
+        self.add_btn_small = tk.Button(desc_frame, text="Add Item", command=self.add_item,
+                                      font=("Arial", 9), bg="#28a745", fg="white", width=8)
+        self.add_btn_small.pack(side="left", anchor="n", pady=(0, 15))
+        
+        row += 1
+
+        # Quantity
+        tk.Label(self.left_frame, text="Quantity", font=("Arial", 10, "bold"), 
+                bg="#ffffff").grid(row=row, column=0, sticky="w", pady=5)
+        self.qty_entry = tk.Entry(self.left_frame, font=("Arial", 10), width=25)
+        self.qty_entry.grid(row=row, column=1, sticky="w", pady=5, padx=(10, 0))
+        row += 1
+
+        # Unit with AutoComplete
+        tk.Label(self.left_frame, text="Unit", font=("Arial", 10, "bold"), 
+                bg="#ffffff").grid(row=row, column=0, sticky="w", pady=5)
+        self.unit_entry = AutocompleteCombobox(self.left_frame, values=self.units, 
+                                             font=("Arial", 10), width=23)
+        self.unit_entry.grid(row=row, column=1, sticky="w", pady=5, padx=(10, 0))
+        row += 1
+
+        # Unit Price
+        tk.Label(self.left_frame, text="Unit Price", font=("Arial", 10, "bold"), 
+                bg="#ffffff").grid(row=row, column=0, sticky="w", pady=5)
+        self.price_entry = tk.Entry(self.left_frame, font=("Arial", 10), width=25)
+        self.price_entry.grid(row=row, column=1, sticky="w", pady=5, padx=(10, 0))
+        row += 1
+
+        # Discount
+        tk.Label(self.left_frame, text="Discount (%)", font=("Arial", 10, "bold"), 
+                bg="#ffffff").grid(row=row, column=0, sticky="w", pady=5)
+        self.discount_entry = tk.Entry(self.left_frame, font=("Arial", 10), width=25)
+        self.discount_entry.insert(0, "0")
+        self.discount_entry.grid(row=row, column=1, sticky="w", pady=5, padx=(10, 0))
+        row += 1
+
+        # Buttons - Enhanced with better spacing and styling
+        button_frame = tk.Frame(self.left_frame, bg="#ffffff")
+        button_frame.grid(row=row, column=0, columnspan=2, pady=20, sticky="ew")
+
+        button_style = {"font": ("Arial", 10, "bold"), "width": 12, "height": 2}
+        
+        self.new_btn = tk.Button(button_frame, text="New PO", command=self.new_po, 
+                                bg="#17a2b8", fg="white", **button_style)
+        self.new_btn.pack(side="left", padx=5)
+
+        self.save_btn = tk.Button(button_frame, text="Save PO", command=self.save_po, 
+                                 bg="#007bff", fg="white", **button_style)
+        self.save_btn.pack(side="left", padx=5)
+
+        self.load_btn = tk.Button(button_frame, text="Load PO", command=self.load_po, 
+                                 bg="#6c757d", fg="white", **button_style)
+        self.load_btn.pack(side="left", padx=5)
+
+    def create_preview(self):
+        """Create the enhanced preview section"""
+        # Logo instead of Live Preview heading
+        try:
+            # Create a simple logo using text since we don't have an actual image
+             logo_img = Image.open("logo.png")  
+             logo_img = logo_img.resize((180, 60), Image.LANCZOS)  
+             self.logo = ImageTk.PhotoImage(logo_img)
+             logo_label = tk.Label(self.right_frame, image=self.logo, bg="#f8f9fa")
+             logo_label.pack(pady=(0, 15))
+        except:
+            # Fallback to text if logo can't be loaded
+            logo_label = tk.Label(self.right_frame, text="COMPANY LOGO", font=("Arial", 16, "bold"), 
+                                bg="#f8f9fa", fg="#2c5aa0")
+            logo_label.pack(pady=(0, 15))
+
+        # Enhanced Header Preview
+        self.header_frame = tk.Frame(self.right_frame, bg="#ffffff", relief="ridge", bd=3, height=200)
+        self.header_frame.pack(fill="x", pady=10, padx=10)
+        self.header_frame.pack_propagate(False)
+
+        # Three columns with better styling
+        self.left_col = tk.Frame(self.header_frame, bg="#e8f4fd", width=180, height=180, relief="solid", bd=1)
+        self.left_col.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+        self.left_col.pack_propagate(False)
+
+        self.middle_col = tk.Frame(self.header_frame, bg="#fff2e8", width=220, height=180, relief="solid", bd=1)
+        self.middle_col.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+        self.middle_col.pack_propagate(False)
+
+        self.right_col = tk.Frame(self.header_frame, bg="#e8f8e8", width=180, height=180, relief="solid", bd=1)
+        self.right_col.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+        self.right_col.pack_propagate(False)
+
+        # Left Column - PO Details
+        tk.Label(self.left_col, text="PO DETAILS", font=("Arial", 12, "bold"), 
+                bg="#e8f4fd", fg="#2c5aa0").pack(anchor="w", pady=5, padx=5)
+        self.preview_po_number = tk.Label(self.left_col, text="PO Number: ", font=("Arial", 11), 
+                                        bg="#e8f4fd", anchor="w", justify="left")
+        self.preview_po_number.pack(fill="x", anchor="w", pady=2, padx=5)
+        self.preview_date = tk.Label(self.left_col, text="Date: ", font=("Arial", 11), 
+                                   bg="#e8f4fd", anchor="w", justify="left")
+        self.preview_date.pack(fill="x", anchor="w", pady=2, padx=5)
+        self.preview_currency = tk.Label(self.left_col, text="Currency: ", font=("Arial", 11), 
+                                       bg="#e8f4fd", anchor="w", justify="left")
+        self.preview_currency.pack(fill="x", anchor="w", pady=2, padx=5)
+
+        # Middle Column - Supplier Name & Address
+        tk.Label(self.middle_col, text="SUPPLIER INFO", font=("Arial", 12, "bold"), 
+                bg="#fff2e8", fg="#b8860b").pack(anchor="w", pady=5, padx=5)
+        self.preview_supplier_name = tk.Label(self.middle_col, text="Name: ", font=("Arial", 11, "bold"), 
+                                            bg="#fff2e8", anchor="w", justify="left")
+        self.preview_supplier_name.pack(fill="x", anchor="w", pady=2, padx=5)
+        self.preview_supplier_address = tk.Label(self.middle_col, text="Address: ", font=("Arial", 10), 
+                                                bg="#fff2e8", anchor="nw", justify="left", wraplength=200)
+        self.preview_supplier_address.pack(fill="both", expand=True, anchor="nw", pady=2, padx=5)
+
+        # Right Column - References
+        tk.Label(self.right_col, text="REFERENCES", font=("Arial", 12, "bold"), 
+                bg="#e8f8e8", fg="#228b22").pack(anchor="w", pady=5, padx=5)
+        self.preview_supplier_ref = tk.Label(self.right_col, text="Supplier Ref: ", font=("Arial", 11), 
+                                           bg="#e8f8e8", anchor="w", justify="left")
+        self.preview_supplier_ref.pack(fill="x", anchor="w", pady=2, padx=5)
+        self.preview_other_ref = tk.Label(self.right_col, text="Other Ref: ", font=("Arial", 11), 
+                                        bg="#e8f8e8", anchor="w", justify="left")
+        self.preview_other_ref.pack(fill="x", anchor="w", pady=2, padx=5)
+        self.preview_payment = tk.Label(self.right_col, text="Payment: ", font=("Arial", 11), 
+                                      bg="#e8f8e8", anchor="w", justify="left")
+        self.preview_payment.pack(fill="x", anchor="w", pady=2, padx=5)
+
+        # Separator
+        separator = tk.Frame(self.right_frame, height=4, bg="#666")
+        separator.pack(fill="x", pady=15)
+
+        # Items Table with editing capability
+        self.tree = ttk.Treeview(
+            self.right_frame,
+            columns=("slno", "desc", "qty", "unit", "price", "disc", "net", "total"),
+            show="headings", height=12,
+        )
+        
+        # Configure column headings and widths
+        columns = [
+            ("slno", "Sl No", 50),
+            ("desc", "Description", 200),
+            ("qty", "Qty", 60),
+            ("unit", "Unit", 80),
+            ("price", "Price", 80),
+            ("disc", "Disc%", 60),
+            ("net", "Net", 80),
+            ("total", "Total", 100)
+        ]
+        
+        for col_id, heading, width in columns:
+            self.tree.heading(col_id, text=heading)
+            self.tree.column(col_id, width=width)
+        
+        self.tree.pack(pady=10, fill="both", expand=True)
+        
+        # Add editing capability to the treeview
+        self.tree.bind("<Double-1>", self.on_item_double_click)
+
+        # Totals Section with better styling
+        totals_frame = tk.Frame(self.right_frame, bg="#f8f9fa", relief="ridge", bd=2)
+        totals_frame.pack(fill="x", pady=10)
+
+        self.subtotal_lbl = tk.Label(totals_frame, text="Subtotal: 0.00", font=("Arial", 11), 
+                                   bg="#f8f9fa", anchor="e")
+        self.subtotal_lbl.pack(fill="x", padx=10, pady=2)
+        
+        self.gst_lbl = tk.Label(totals_frame, text="GST: 0.00", font=("Arial", 11), 
+                              bg="#f8f9fa", anchor="e")
+        self.gst_lbl.pack(fill="x", padx=10, pady=2)
+        
+        self.total_lbl = tk.Label(totals_frame, text="Grand Total: 0.00", 
+                                font=("Arial", 12, "bold"), bg="#f8f9fa", anchor="e", fg="#d9534f")
+        self.total_lbl.pack(fill="x", padx=10, pady=5)
+        
+        self.words_lbl = tk.Label(totals_frame, text="In Words: Zero", 
+                                font=("Arial", 10), bg="#f8f9fa", wraplength=400)
+        self.words_lbl.pack(fill="x", padx=10, pady=5)
+        
+        # Action buttons for print and open in Excel
+        action_frame = tk.Frame(self.right_frame, bg="#f8f9fa")
+        action_frame.pack(fill="x", pady=10)
+        
+        self.print_btn = tk.Button(action_frame, text="Print", command=self.print_po,
+                                  font=("Arial", 10, "bold"), bg="#6c757d", fg="white", width=10)
+        self.print_btn.pack(side="right", padx=5)
+        
+        self.open_excel_btn = tk.Button(action_frame, text="Open in Excel", command=self.open_in_excel,
+                                       font=("Arial", 10, "bold"), bg="#28a745", fg="white", width=12)
+        self.open_excel_btn.pack(side="right", padx=5)
+
+    def on_item_double_click(self, event):
+        """Allow editing of items in the preview table"""
+        item = self.tree.identify_row(event.y)
+        column = self.tree.identify_column(event.x)
+        
+        if not item or column == "#0":  # Skip if no item selected or tree column
+            return
+            
+        # Get the current value
+        col_index = int(column[1:]) - 1  # Convert column to index
+        current_value = self.tree.item(item, "values")[col_index]
+        
+        # Get the bounding box of the cell
+        x, y, width, height = self.tree.bbox(item, column)
+        
+        # Create an entry widget for editing
+        entry = tk.Entry(self.tree, font=("Arial", 10))
+        entry.insert(0, current_value)
+        entry.place(x=x, y=y, width=width, height=height)
+        
+        def save_edit(event):
+            # Get the new value
+            new_value = entry.get()
+            
+            # Update the treeview
+            values = list(self.tree.item(item, "values"))
+            values[col_index] = new_value
+            
+            # Update the corresponding item in self.items
+            item_index = int(values[0]) - 1  # Slno is 1-based, index is 0-based
+            if 0 <= item_index < len(self.items):
+                # Convert the item to a list for modification
+                item_list = list(self.items[item_index])
+                
+                # Update the specific field
+                if col_index == 1:  # Description
+                    item_list[1] = new_value
+                elif col_index == 2:  # Quantity
+                    try:
+                        item_list[2] = int(new_value)
+                    except ValueError:
+                        messagebox.showerror("Error", "Quantity must be a number")
+                        entry.destroy()
+                        return
+                elif col_index == 3:  # Unit
+                    item_list[3] = new_value
+                elif col_index == 4:  # Price
+                    try:
+                        item_list[4] = float(new_value)
+                    except ValueError:
+                        messagebox.showerror("Error", "Price must be a number")
+                        entry.destroy()
+                        return
+                elif col_index == 5:  # Discount
+                    try:
+                        item_list[5] = float(new_value)
+                    except ValueError:
+                        messagebox.showerror("Error", "Discount must be a number")
+                        entry.destroy()
+                        return
+                
+                # Recalculate net price and total
+                price = item_list[4]
+                disc = item_list[5]
+                qty = item_list[2]
+                net_price = price - (price * disc / 100)
+                line_total = qty * net_price
+                
+                item_list[6] = net_price
+                item_list[7] = line_total
+                
+                # Update the values in the treeview
+                values[6] = f"{net_price:.2f}"
+                values[7] = f"{line_total:.2f}"
+                
+                # Update the items list
+                self.items[item_index] = tuple(item_list)
+            
+            self.tree.item(item, values=values)
+            entry.destroy()
+            self.update_preview()  # Recalculate totals
+        
+        def lose_focus(event):
+            entry.destroy()
+            
+        entry.bind("<Return>", save_edit)
+        entry.bind("<FocusOut>", lose_focus)
+        entry.focus_set()
+
+    def on_gst_type_change(self, event=None):
+        """Handle GST type change - show single GST or SGST/CGST fields"""
+        gst_type = self.gst_type.get()
+        
+        # Hide all GST widgets first
+        for widget in [self.gst_entry, self.sgst_label, self.sgst_entry, self.cgst_label, self.cgst_entry]:
+            widget.grid_remove()
+        
+        if gst_type == "GST":
+            # Show single GST field
+            tk.Label(self.gst_frame, text="GST (%)", font=("Arial", 10, "bold"), 
+                    bg="#ffffff").grid(row=0, column=0, sticky="w", padx=(0, 10))
+            self.gst_entry.grid(row=0, column=1, sticky="w")
+        elif gst_type == "SGST/CGST":
+            # Show SGST and CGST fields
+            self.sgst_label.grid(row=0, column=0, sticky="w", padx=(0, 10))
+            self.sgst_entry.grid(row=0, column=1, sticky="w", padx=(0, 20))
+            self.cgst_label.grid(row=0, column=2, sticky="w", padx=(0, 10))
+            self.cgst_entry.grid(row=0, column=3, sticky="w")
+        else:  # "Others"
+            # Show SGST and CGST fields for "Others" option
+            self.sgst_label.grid(row=0, column=0, sticky="w", padx=(0, 10))
+            self.sgst_entry.grid(row=0, column=1, sticky="w", padx=(0, 20))
+            self.cgst_label.grid(row=0, column=2, sticky="w", padx=(0, 10))
+            self.cgst_entry.grid(row=0, column=3, sticky="w")
+
+    def on_po_number_change(self, event=None):
+        """Auto-load PO details when typing PO number"""
+        po_text = self.po_number.get().strip()
+        if len(po_text) < 3:  # Don't search for very short entries
+            return
+            
+        # Normalize the PO number
+        po_number = _normalize_po_number(po_text)
+        
+        # Look for matching PO files
+        matches = []
+        for root, _, files in os.walk(SAVE_FOLDER):
+            for file in files:
+                if file.endswith(".xlsx") and file.startswith(po_number):
+                    matches.append(os.path.join(root, file))
+        
+        if matches:
+            # Load the first match automatically
+            self._load_po_file_editable(matches[0])
+
+    def _load_po_file_editable(self, file):
+        """Load PO file with editable item details"""
+        try:
+            wb = load_workbook(file, data_only=True)
+            ws = wb.active
+            
+            # Load header information
+            self.date_entry.delete(0, tk.END)
+            self.date_entry.insert(0, ws["I4"].value or date.today().strftime("%d-%m-%Y"))
+            
+            supplier_info = ws["A10"].value or ""
+            parts = supplier_info.split("\n", 1)
+            self.supplier_name.set(parts[0] if parts else "")
+            self.supplier_address_combo.set(parts[1] if len(parts) > 1 else "")
+            self.supplier_address_text.delete("1.0", tk.END)
+            if len(parts) > 1:
+                self.supplier_address_text.insert("1.0", parts[1])
+                
+            self.supplier_ref.set(ws["G9"].value or "")
+            self.other_ref.set(ws["I9"].value or "")
+            self.payment_mode.set(ws["I5"].value or "Cash")
+            
+            # Load GST information
+            sgst_percent = ws["H28"].value
+            cgst_percent = ws["H29"].value
+            if sgst_percent and cgst_percent:
+                self.gst_type.set("SGST/CGST")
+                self.sgst_entry.delete(0, tk.END)
+                self.sgst_entry.insert(0, str(sgst_percent))
+                self.cgst_entry.delete(0, tk.END)
+                self.cgst_entry.insert(0, str(cgst_percent))
+            else:
+                gst_percent = ws["H28"].value
+                if gst_percent:
+                    self.gst_type.set("GST")
+                    self.gst_entry.delete(0, tk.END)
+                    self.gst_entry.insert(0, str(gst_percent))
+            
+            self.on_gst_type_change()
+            
+            # Load items (these will be editable)
+            self.items.clear()
+            row = 15
+            while ws[f"A{row}"].value:
+                slno = ws[f"A{row}"].value
+                desc = ws[f"B{row}"].value
+                qty = ws[f"D{row}"].value
+                unit = ws[f"E{row}"].value
+                price_str = str(ws[f"F{row}"].value or "0")
+                # Remove currency symbols and extract number
+                price = float(re.sub(r'[^\d.]', '', price_str) or "0")
+                disc = ws[f"G{row}"].value or 0
+                net_str = str(ws[f"H{row}"].value or "0")
+                net = float(re.sub(r'[^\d.]', '', net_str) or "0")
+                total_str = str(ws[f"I{row}"].value or "0")
+                total = float(re.sub(r'[^\d.]', '', total_str) or "0")
+                
+                self.items.append((slno, desc, qty, unit, price, disc, net, total))
+                row += 1
+                
+            self.update_preview()
+        except Exception as e:
+            print(f"Error loading PO: {e}")  # Debug info, don't show error to user for auto-load
+
+    def new_po(self):
+        """Create a new PO with clean form"""
+        self.po_number.delete(0, tk.END)
+        self.po_number.insert(0, f"PO-{get_next_po_number():03d}")
+        self.date_entry.delete(0, tk.END)
+        self.date_entry.insert(0, date.today().strftime("%d-%m-%Y"))
+        self.currency_combo.current(0)
+        self.supplier_name.set("")
+        self.supplier_address_combo.set("")
+        self.supplier_address_text.delete("1.0", tk.END)
+        self.supplier_ref.set("")
+        self.other_ref.set("")
+        self.payment_mode.current(0)
+        self.notes_text.delete("1.0", tk.END)
+        self.gst_entry.delete(0, tk.END)
+        self.gst_entry.insert(0, "18")
+        self.sgst_entry.delete(0, tk.END)
+        self.sgst_entry.insert(0, "9")
+        self.cgst_entry.delete(0, tk.END)
+        self.cgst_entry.insert(0, "9")
+        self.gst_type.current(0)
+        self.on_gst_type_change()
+        self.desc_entry.delete("1.0", tk.END)
+        self.qty_entry.delete(0, tk.END)
+        self.unit_entry.set("")
+        self.price_entry.delete(0, tk.END)
+        self.discount_entry.delete(0, tk.END)
+        self.discount_entry.insert(0, "0")
+        self.items.clear()
+        self.update_preview()
+
+    def add_item(self):
+        """Add item to the PO"""
+        try:
+            desc = self.desc_entry.get("1.0", tk.END).strip()
+            qty = safe_int(self.qty_entry.get())
+            unit = self.unit_entry.get() or "Nos"
+            price = safe_float(self.price_entry.get())
+            disc = safe_float(self.discount_entry.get())
+            net_price = price - (price * disc / 100)
+            line_total = qty * net_price
+            slno = len(self.items) + 1
+            self.items.append((slno, desc, qty, unit, price, disc, net_price, line_total))
+            self.update_preview()
+
+            # Clear entries after adding
+            self.desc_entry.delete("1.0", tk.END)
+            self.qty_entry.delete(0, tk.END)
+            self.unit_entry.set("")
+            self.price_entry.delete(0, tk.END)
+            self.discount_entry.delete(0, tk.END)
+            self.discount_entry.insert(0, "0")
+
+            # Update suggestions
+            if unit and unit not in self.units:
+                self.units.append(unit)
+                self.unit_entry.update_values(self.units)
+
+        except ValueError:
+            messagebox.showerror("Error", "Please enter valid Quantity and Price")
+        except Exception as e:
+            messagebox.showerror("Error", f"Error adding item: {str(e)}")
+
+    def update_preview(self):
+        """Update the preview table and totals"""
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        
+        subtotal = 0
+        for item in self.items:
+            formatted_item = list(item)
+            formatted_item[4] = f"{formatted_item[4]:.2f}"  # Price
+            formatted_item[6] = f"{formatted_item[6]:.2f}"  # Net
+            formatted_item[7] = f"{formatted_item[7]:.2f}"  # Total
+            self.tree.insert("", "end", values=formatted_item)
+            subtotal += item[-1]
+        
+        # Calculate GST
+        try:
+            if self.gst_type.get() == "GST":
+                gst_rate = float(self.gst_entry.get() or 0)
+                sgst_rate = 0
+                cgst_rate = 0
+            elif self.gst_type.get() == "SGST/CGST":
+                sgst_rate = float(self.sgst_entry.get() or 0)
+                cgst_rate = float(self.cgst_entry.get() or 0)
+                gst_rate = sgst_rate + cgst_rate
+            else:  # "Others"
+                sgst_rate = float(self.sgst_entry.get() or 0)
+                cgst_rate = float(self.cgst_entry.get() or 0)
+                gst_rate = sgst_rate + cgst_rate
+        except ValueError:
+            gst_rate = 0
+            sgst_rate = 0
+            cgst_rate = 0
+        
+        gst_amt = subtotal * gst_rate / 100
+        sgst_amt = subtotal * sgst_rate / 100 if sgst_rate > 0 else 0
+        cgst_amt = subtotal * cgst_rate / 100 if cgst_rate > 0 else 0
+        total = subtotal + gst_amt
+        
+        currency = self.currency_combo.get() or "INR"
+        
+        # Update totals
+        self.subtotal_lbl.config(text=f"Subtotal: {currency} {subtotal:.2f}")
+        
+        if self.gst_type.get() == "GST":
+            self.gst_lbl.config(text=f"GST ({gst_rate:.1f}%): {currency} {gst_amt:.2f}")
+        elif self.gst_type.get() == "SGST/CGST":
+            self.gst_lbl.config(text=f"SGST ({sgst_rate:.1f}%) + CGST ({cgst_rate:.1f}%): {currency} {gst_amt:.2f}")
+        else:  # "Others"
+            self.gst_lbl.config(text=f"SGST ({sgst_rate:.1f}%) + CGST ({cgst_rate:.1f}%): {currency} {gst_amt:.2f}")
+            
+        self.total_lbl.config(text=f"Grand Total: {currency} {total:.2f}")
+        
+        # Amount in words
+        try:
+            words = num2words(total, to='currency', currency=currency.lower())
+            self.words_lbl.config(text=f"In Words: {currency} {words.capitalize()}")
+        except:
+            self.words_lbl.config(text=f"In Words: {currency} {num2words(total).title()} Only")
+
+    def update_header_preview(self):
+        """Update the header preview section"""
+        supplier_addr = self.supplier_address_text.get("1.0", tk.END).strip()
+        
+        # Update left column - PO Details
+        self.preview_po_number.config(text=f"PO Number:\n{self.po_number.get()}", fg="#1a1a1a")
+        self.preview_date.config(text=f"Date:\n{self.date_entry.get()}", fg="#1a1a1a")
+        self.preview_currency.config(text=f"Currency:\n{self.currency_combo.get()}", fg="#1a1a1a")
+        
+        # Update middle column - Supplier Info
+        supplier_name = self.supplier_name.get()
+        self.preview_supplier_name.config(text=f"Name:\n{supplier_name if supplier_name else 'Not specified'}", fg="#8b4513")
+        
+        # Format address for better display
+        if supplier_addr:
+            display_addr = supplier_addr[:80] + "..." if len(supplier_addr) > 80 else supplier_addr
+            self.preview_supplier_address.config(text=f"Address:\n{display_addr}", fg="#1a1a1a")
+        else:
+            self.preview_supplier_address.config(text="Address:\nNot specified", fg="#999")
+        
+        # Update right column - References
+        supplier_ref = self.supplier_ref.get()
+        other_ref = self.other_ref.get()
+        payment = self.payment_mode.get()
+        self.preview_supplier_ref.config(text=f"Supplier Ref:\n{supplier_ref if supplier_ref else 'Not specified'}", fg="#1a1a1a")
+        self.preview_other_ref.config(text=f"Other Ref:\n{other_ref if other_ref else 'Not specified'}", fg="#1a1a1a")
+        self.preview_payment.config(text=f"Payment:\n{payment if payment else 'Not specified'}", fg="#1a1a1a")
+        
+        self.root.after(500, self.update_header_preview)
+
+    def save_po(self):
+        """Save PO to Excel with enhanced filename (PO number + supplier name)"""
+        if not self.items:
+            messagebox.showerror("Error", "No items to save")
+            return
+        try:
+            po_number = _normalize_po_number(self.po_number.get())
+            self.po_number.delete(0, tk.END)
+            self.po_number.insert(0, po_number)
+
+            supplier_addr = self.supplier_address_text.get("1.0", tk.END).strip()
+            supplier_name = self.supplier_name.get().strip()
+            
+            # Create filename with PO number + supplier name
+            safe_supplier = "".join(c if c.isalnum() or c in (" ", "-", "_") else "_" for c in supplier_name)
+            if safe_supplier:
+                base_filename = f"{po_number}_{safe_supplier}"
+            else:
+                base_filename = po_number
+            
+            # Create folder based on address
+            safe_addr = "".join(c if c.isalnum() or c in (" ", "-", "_") else "_" for c in supplier_addr)
+            folder_path = os.path.join(SAVE_FOLDER, safe_addr if safe_addr else "Unknown_Address")
+            if not os.path.exists(folder_path):
+                os.makedirs(folder_path)
+
+            filename = os.path.join(folder_path, f"{base_filename}.xlsx")
+
+            # Handle revisions
+            rev = 1
+            while os.path.exists(filename):
+                filename = os.path.join(folder_path, f"{base_filename}_Revised{rev}.xlsx")
+                rev += 1
+
+            # Load and update template
+            wb = load_workbook("PO_Template.xlsx")
+            ws = wb.active
+            
+            # Fill header information
+            ws["G4"] = po_number
+            ws["I4"] = self.date_entry.get()
+            ws["A10"] = supplier_name + "\n" + supplier_addr
+            ws["G9"] = self.supplier_ref.get()
+            ws["I9"] = self.other_ref.get()
+            ws["I5"] = self.payment_mode.get()
+            
+            # Fill GST information
+            if self.gst_type.get() == "GST":
+                gst_rate = float(self.gst_entry.get() or 0)
+                ws["H28"] = gst_rate  # GST percentage
+                ws["H29"] = ""  # Clear CGST percentage
+            else:  # "SGST/CGST" or "Others"
+                sgst_rate = float(self.sgst_entry.get() or 0)
+                cgst_rate = float(self.cgst_entry.get() or 0)
+                ws["H28"] = sgst_rate  # SGST percentage
+                ws["H29"] = cgst_rate  # CGST percentage
+            
+            # Fill items
+            start_row = 15
+            for item in self.items:
+                slno, desc, qty, unit, price, disc, net, total = item
+                ws[f"A{start_row}"] = slno
+                ws[f"B{start_row}"] = desc
+                ws[f"D{start_row}"] = qty
+                ws[f"E{start_row}"] = unit
+                ws[f"F{start_row}"] = f"₹ {price:.2f}"
+                ws[f"G{start_row}"] = disc
+                ws[f"H{start_row}"] = f"₹ {net:.2f}"
+                ws[f"I{start_row}"] = f"₹ {total:.2f}"
+                start_row += 1
+            
+            # Calculate totals
+            subtotal = sum(i[-1] for i in self.items)
+            
+            if self.gst_type.get() == "GST":
+                gst_rate = float(self.gst_entry.get() or 0)
+                gst_amt = subtotal * gst_rate / 100
+                sgst_amt = 0
+                cgst_amt = 0
+            else:  # "SGST/CGST" or "Others"
+                sgst_rate = float(self.sgst_entry.get() or 0)
+                cgst_rate = float(self.cgst_entry.get() or 0)
+                sgst_amt = subtotal * sgst_rate / 100
+                cgst_amt = subtotal * cgst_rate / 100
+                gst_amt = sgst_amt + cgst_amt
+            
+            grand_total = subtotal + gst_amt
+            
+            ws["I27"] = f"₹ {subtotal:.2f}"
+            
+            if self.gst_type.get() == "GST":
+                ws["I28"] = f"₹ {gst_amt:.2f}"
+                ws["I29"] = ""
+            else:  # "SGST/CGST" or "Others"
+                ws["I28"] = f"₹ {sgst_amt:.2f}"
+                ws["I29"] = f"₹ {cgst_amt:.2f}"
+                
+            ws["I31"] = f"₹ {grand_total:.2f}"
+            
+            # Amount in words
+            currency = self.currency_combo.get() or "INR"
+            try:
+                words = num2words(grand_total, to='currency', currency=currency.lower())
+                ws["A32"] = f"{currency} {words.capitalize()}"
+            except:
+                ws["A32"] = f"{currency} {num2words(grand_total).title()} Only"
+            
+            wb.save(filename)
+            messagebox.showinfo("Success", f"PO saved successfully!\n{filename}")
+            
+            # Update suggestions
+            if supplier_name and supplier_name not in self.supplier_names:
+                self.supplier_names.append(supplier_name)
+                self.supplier_name.update_values(self.supplier_names)
+                
+            if supplier_addr and supplier_addr not in self.supplier_addresses:
+                self.supplier_addresses.append(supplier_addr)
+                self.supplier_address_combo.update_values(self.supplier_addresses)
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Error saving PO: {str(e)}")
+
+    def load_po(self):
+        """Load PO from file"""
+        file = filedialog.askopenfilename(
+            initialdir=SAVE_FOLDER, 
+            title="Select PO file to load",
+            filetypes=[("Excel Files", "*.xlsx")]
+        )
+        if not file:
+            return
+        self._load_po_file(file)
+
+    def load_po_by_number(self, event=None):
+        """Load PO by typing exact PO number"""
+        raw = self.po_number.get().strip()
+        po_number = _normalize_po_number(raw)
+        self.po_number.delete(0, tk.END)
+        self.po_number.insert(0, po_number)
+
+        matches = []
+        for root, _, files in os.walk(SAVE_FOLDER):
+            for file in files:
+                if file.endswith(".xlsx") and file.startswith(po_number):
+                    matches.append(os.path.join(root, file))
+
+        if not matches:
+            messagebox.showwarning("Not Found", f"No PO found for {po_number}")
+            return
+
+        if len(matches) > 1:
+            options = "\n".join(f"{i+1}. {os.path.basename(p)}" for i, p in enumerate(matches))
+            ans = simpledialog.askstring(
+                "Multiple Versions Found",
+                f"Found multiple files for {po_number}:\n\n{options}\n\nType the number to load:")
+            if not ans or not ans.isdigit() or not (1 <= int(ans) <= len(matches)):
+                return
+            file = matches[int(ans) - 1]
+        else:
+            file = matches[0]
+
+        self._load_po_file(file)
+
+    def _load_po_file(self, file):
+        """Load PO file completely (for manual load)"""
+        try:
+            wb = load_workbook(file, data_only=True)
+            ws = wb.active
+            
+            # Load all information including PO number
+            self.po_number.delete(0, tk.END)
+            self.po_number.insert(0, ws["G4"].value or "")
+            
+            self.date_entry.delete(0, tk.END)
+            self.date_entry.insert(0, ws["I4"].value or "")
+            
+            supplier_info = ws["A10"].value or ""
+            parts = supplier_info.split("\n", 1)
+            self.supplier_name.set(parts[0] if parts else "")
+            self.supplier_address_combo.set(parts[1] if len(parts) > 1 else "")
+            self.supplier_address_text.delete("1.0", tk.END)
+            if len(parts) > 1:
+                self.supplier_address_text.insert("1.0", parts[1])
+                
+            self.supplier_ref.set(ws["G9"].value or "")
+            self.other_ref.set(ws["I9"].value or "")
+            self.payment_mode.set(ws["I5"].value or "Cash")
+            
+            # Load GST information
+            sgst_percent = ws["H28"].value
+            cgst_percent = ws["H29"].value
+            if sgst_percent and cgst_percent:
+                self.gst_type.set("SGST/CGST")
+                self.sgst_entry.delete(0, tk.END)
+                self.sgst_entry.insert(0, str(sgst_percent))
+                self.cgst_entry.delete(0, tk.END)
+                self.cgst_entry.insert(0, str(cgst_percent))
+            else:
+                gst_percent = ws["H28"].value
+                if gst_percent:
+                    self.gst_type.set("GST")
+                    self.gst_entry.delete(0, tk.END)
+                    self.gst_entry.insert(0, str(gst_percent))
+            
+            self.on_gst_type_change()
+            
+            # Load items
+            self.items.clear()
+            row = 15
+            while ws[f"A{row}"].value:
+                slno = ws[f"A{row}"].value
+                desc = ws[f"B{row}"].value
+                qty = ws[f"D{row}"].value
+                unit = ws[f"E{row}"].value
+                price_str = str(ws[f"F{row}"].value or "0")
+                price = safe_float(re.sub(r'[^\d.]', '', price_str))
+                disc = safe_float(ws[f"G{row}"].value)
+                net_str = str(ws[f"H{row}"].value or "0")
+                net = safe_float(re.sub(r'[^\d.]', '', net_str))
+                total_str = str(ws[f"I{row}"].value or "0")
+                total = safe_float(re.sub(r'[^\d.]', '', total_str))
+                
+                self.items.append((slno, desc, qty, unit, price, disc, net, total))
+                row += 1
+                
+            self.update_preview()
+            messagebox.showinfo("Success", f"PO loaded successfully!\n{os.path.basename(file)}")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Error loading PO: {str(e)}")
+
+    def print_po(self):
+        """Print the current PO"""
+        if not self.items:
+            messagebox.showerror("Error", "No items to print")
+            return
+            
+        try:
+            # Create a temporary file
+            with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
+                # Save the PO to the temporary file
+                self._save_to_temp_file(tmp.name)
+                
+                # Try to print using the default application
+                if os.name == 'nt':  # Windows
+                    os.startfile(tmp.name, 'print')
+                elif os.name == 'posix':  # macOS, Linux
+                    subprocess.run(['lp', tmp.name])
+                else:
+                    messagebox.showinfo("Print", "Please print the file manually from Excel")
+                    
+        except Exception as e:
+            messagebox.showerror("Error", f"Error printing PO: {str(e)}")
+
+    def open_in_excel(self):
+        """Open the current PO in Excel"""
+        if not self.items:
+            messagebox.showerror("Error", "No items to open")
+            return
+            
+        try:
+            # Create a temporary file
+            with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
+                # Save the PO to the temporary file
+                self._save_to_temp_file(tmp.name)
+                
+                # Open the file with the default application
+                if os.name == 'nt':  # Windows
+                    os.startfile(tmp.name)
+                elif os.name == 'posix':  # macOS, Linux
+                    subprocess.run(['open', tmp.name])
+                else:
+                    messagebox.showinfo("Open", "Please open the file manually from Excel")
+                    
+        except Exception as e:
+            messagebox.showerror("Error", f"Error opening PO: {str(e)}")
+
+    def _save_to_temp_file(self, filename):
+        """Save the current PO to a temporary file"""
+        # Load and update template
+        wb = load_workbook("PO_Template.xlsx")
+        ws = wb.active
+        
+        # Fill header information
+        po_number = _normalize_po_number(self.po_number.get())
+        supplier_addr = self.supplier_address_text.get("1.0", tk.END).strip()
+        supplier_name = self.supplier_name.get().strip()
+        
+        ws["G4"] = po_number
+        ws["I4"] = self.date_entry.get()
+        ws["A10"] = supplier_name + "\n" + supplier_addr
+        ws["G9"] = self.supplier_ref.get()
+        ws["I9"] = self.other_ref.get()
+        ws["I5"] = self.payment_mode.get()
+        
+        # Fill GST information
+        if self.gst_type.get() == "GST":
+            gst_rate = float(self.gst_entry.get() or 0)
+            ws["H28"] = gst_rate  # GST percentage
+            ws["H29"] = ""  # Clear CGST percentage
+        else:  # "SGST/CGST" or "Others"
+            sgst_rate = float(self.sgst_entry.get() or 0)
+            cgst_rate = float(self.cgst_entry.get() or 0)
+            ws["H28"] = sgst_rate  # SGST percentage
+            ws["H29"] = cgst_rate  # CGST percentage
+        
+        # Fill items
+        start_row = 15
+        for item in self.items:
+            slno, desc, qty, unit, price, disc, net, total = item
+            ws[f"A{start_row}"] = slno
+            ws[f"B{start_row}"] = desc
+            ws[f"D{start_row}"] = qty
+            ws[f"E{start_row}"] = unit
+            ws[f"F{start_row}"] = f"₹ {price:.2f}"
+            ws[f"G{start_row}"] = disc
+            ws[f"H{start_row}"] = f"₹ {net:.2f}"
+            ws[f"I{start_row}"] = f"₹ {total:.2f}"
+            start_row += 1
+        
+        # Calculate totals
+        subtotal = sum(i[-1] for i in self.items)
+        
+        if self.gst_type.get() == "GST":
+            gst_rate = float(self.gst_entry.get() or 0)
+            gst_amt = subtotal * gst_rate / 100
+            sgst_amt = 0
+            cgst_amt = 0
+        else:  # "SGST/CGST" or "Others"
+            sgst_rate = float(self.sgst_entry.get() or 0)
+            cgst_rate = float(self.cgst_entry.get() or 0)
+            sgst_amt = subtotal * sgst_rate / 100
+            cgst_amt = subtotal * cgst_rate / 100
+            gst_amt = sgst_amt + cgst_amt
+        
+        grand_total = subtotal + gst_amt
+        
+        ws["I27"] = f"₹ {subtotal:.2f}"
+        
+        if self.gst_type.get() == "GST":
+            ws["I28"] = f"₹ {gst_amt:.2f}"
+            ws["I29"] = ""
+        else:  # "SGST/CGST" or "Others"
+            ws["I28"] = f"₹ {sgst_amt:.2f}"
+            ws["I29"] = f"₹ {cgst_amt:.2f}"
+            
+        ws["I31"] = f"₹ {grand_total:.2f}"
+        
+        # Amount in words
+        currency = self.currency_combo.get() or "INR"
+        try:
+            words = num2words(grand_total, to='currency', currency=currency.lower())
+            ws["A32"] = f"{currency} {words.capitalize()}"
+        except:
+            ws["A32"] = f"{currency} {num2words(grand_total).title()} Only"
+        
+        wb.save(filename)
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = POApp(root)
+    root.mainloop()
